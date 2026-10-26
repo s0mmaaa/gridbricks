@@ -1,7 +1,7 @@
 # GridBricks — Project Development Log
 
 > **Client**: UK Energy Utility — Day-Ahead Market Procurement Team  
-> **Goal**: Web app to visualise wind power actuals vs. forecasts, and quantify forecast accuracy  
+> **Goal**: Web app to visualise wind power actuals vs. forecasts, and quantify forecast accuracy   
 > **Started**: 2026-10-26
 
 ---
@@ -182,7 +182,191 @@ gridbricks/
 
 ## Phase 2 — System Design & API Contract
 
-**Status**: NEXT
+**Status**: COMPLETE
+**Date**: 2026-10-26
+
+---
+
+### 2.1 Elexon API — Real Data Shapes (Verified Live)
+
+#### WINDFOR (Forecasts) — Sample Record
+```json
+{
+  "dataset": "WINDFOR",
+  "publishTime": "2026-10-26T04:30:00Z",
+  "startTime": "2026-10-26T06:00:00Z",
+  "generation": 13295
+}
+```
+- Resolution: 1-hour slots (startTime)
+- publishTime: when forecast was published (multiple per startTime = versioned forecasts)
+- generation: MW (integer)
+- No pagination — stream endpoint returns full result set
+- Query params: `from`, `to` (ISO8601), `format=json`
+
+#### FUELHH (Actuals) — Sample Record
+```json
+{
+  "dataset": "FUELHH",
+  "publishTime": "2026-10-26T06:30:00Z",
+  "startTime": "2026-10-26T06:00:00Z",
+  "settlementDate": "2026-10-26",
+  "settlementPeriod": 13,
+  "fuelType": "WIND",
+  "generation": 10624
+}
+```
+- Resolution: 30-minute slots (startTime)
+- settlementPeriod: 1..48 (48 per day)
+- publishTime ≈ startTime + 30 min (near-real-time actual)
+- Must filter by `fuelType=WIND`
+- Query params: `from`, `to` (ISO8601), `fuelType=WIND`, `format=json`
+
+#### Key Observations
+| Item | Observation |
+|---|---|
+| WINDFOR resolution | 1-hour (startTime steps by 1h) |
+| FUELHH resolution | 30-minute (startTime steps by 30m) |
+| Alignment strategy | Aggregate FUELHH to 1-hour by averaging adjacent 30-min periods |
+| Multiple forecasts | WINDFOR returns all publishTime versions for same startTime — pick latest for "current forecast" |
+| Jan 2026 date range | `from=2026-01-01T00:00:00Z&to=2026-02-01T00:00:00Z` |
+
+---
+
+### 2.2 Backend API Contract (FastAPI)
+
+Base URL: `https://<heroku-app>.herokuapp.com`
+
+#### GET /api/forecasts
+Returns all wind generation forecasts for a given delivery date, grouped by publishTime.
+
+**Request**
+```
+GET /api/forecasts?date=2026-01-15
+```
+| Param | Type | Required | Description |
+|---|---|---|---|
+| date | string (YYYY-MM-DD) | Yes | The delivery date to fetch forecasts for |
+
+**Response**
+```json
+{
+  "date": "2026-01-15",
+  "forecasts": [
+    {
+      "publishTime": "2026-01-14T10:30:00Z",
+      "isLatest": true,
+      "series": [
+        { "startTime": "2026-01-15T00:00:00Z", "generation": 4200 },
+        { "startTime": "2026-01-15T01:00:00Z", "generation": 4350 }
+      ]
+    }
+  ]
+}
+```
+
+#### GET /api/actuals
+Returns actual wind generation for a given delivery date (30-min resolution, aligned to hours).
+
+**Request**
+```
+GET /api/actuals?date=2026-01-15
+```
+
+**Response**
+```json
+{
+  "date": "2026-01-15",
+  "actuals": [
+    { "startTime": "2026-01-15T00:00:00Z", "generation": 4150 },
+    { "startTime": "2026-01-15T01:00:00Z", "generation": 4400 }
+  ]
+}
+```
+
+#### GET /api/accuracy
+Returns error metrics (MAE, RMSE, MAPE) comparing latest forecast vs actuals, per day.
+
+**Request**
+```
+GET /api/accuracy?from=2026-01-01&to=2026-01-31
+```
+
+**Response**
+```json
+{
+  "from": "2026-01-01",
+  "to": "2026-01-31",
+  "daily": [
+    {
+      "date": "2026-01-01",
+      "mae": 312.5,
+      "rmse": 418.2,
+      "mape": 7.4,
+      "n_points": 24
+    }
+  ],
+  "summary": {
+    "mae": 298.1,
+    "rmse": 401.7,
+    "mape": 6.9
+  }
+}
+```
+
+#### GET /health
+Simple liveness check for Heroku.
+```json
+{ "status": "ok" }
+```
+
+---
+
+### 2.3 React Component Tree
+
+```
+App
+├── Layout
+│   ├── Header (logo, nav)
+│   └── Sidebar (date picker, controls)
+├── Pages
+│   ├── ForecastExplorer (route: /)
+│   │   ├── DateSelector
+│   │   ├── ForecastVersionList (publish times, toggle visibility)
+│   │   └── ForecastChart (Recharts LineChart)
+│   │       ├── Each publishTime → coloured line
+│   │       └── Tooltip with generation value + publish time
+│   └── AccuracyDashboard (route: /accuracy)
+│       ├── DateRangePicker
+│       ├── MetricsSummaryCards (MAE / RMSE / MAPE)
+│       ├── ActualsVsForecastChart (LineChart — 2 series)
+│       └── DailyErrorChart (BarChart — MAE per day over Jan 2026)
+└── shared/
+    ├── LoadingSpinner
+    ├── ErrorBanner
+    └── StatCard
+```
+
+---
+
+### 2.4 State Management
+
+- **Local state** (useState/useEffect) for each page — no Redux needed
+- **React Query (TanStack Query)** for data fetching, caching, and loading states
+- **URL-driven state**: selected date stored in query params (`?date=2026-01-15`) for shareability
+
+---
+
+### 2.5 Metrics Definitions
+
+| Metric | Formula | Unit |
+|---|---|---|
+| MAE | mean(|forecast - actual|) | MW |
+| RMSE | sqrt(mean((forecast - actual)^2)) | MW |
+| MAPE | mean(|forecast - actual| / actual) * 100 | % |
+
+All computed server-side in `services/metrics.py`.
+
 
 ---
 
